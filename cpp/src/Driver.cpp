@@ -66,6 +66,7 @@
 #include "value_classes/ValueStore.h"
 
 #include "tinyxml.h"
+#include "AutoLock.h"
 
 #include "Utils.h"
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -193,9 +194,8 @@ Driver::~Driver()
 	// The order of the statements below has been achieved by mitigating freed memory
 	//references using a memory allocator checker. Do not rearrange unless you are
 	//certain memory won't be referenced out of order. --Greg Satz, April 2010
-	m_initMutex->Lock();
-	m_exit = true;
-	m_initMutex->Unlock();
+	
+	SignalExit();
 
 	m_pollThread->Stop();
 	m_pollThread->Release();
@@ -413,10 +413,7 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 					}
 					case 0:
 					{
-						// Exit has been signalled
-						m_initMutex->Lock();
-						m_exit = true;
-						m_initMutex->Unlock();
+						SignalExit();	
 						return;
 					}
 					case 1:
@@ -471,11 +468,8 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 		{
 			// Retry every 5 seconds for the first two minutes
 			if (Internal::Platform::Wait::Single(_exitEvent, 5000) == 0)
-			{
-				// Exit signalled.
-				m_initMutex->Lock();
-				m_exit = true;
-				m_initMutex->Unlock();
+			{	
+				SignalExit();
 				return;
 			}
 		}
@@ -484,14 +478,16 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 			// Retry every 30 seconds after that
 			if (Internal::Platform::Wait::Single(_exitEvent, 30000) == 0)
 			{
-				// Exit signalled.
-				m_initMutex->Lock();
-				m_exit = true;
-				m_initMutex->Unlock();
+				SignalExit();
 				return;
 			}
 		}
 	}
+}
+
+void Driver::SignalExit(){
+	AutoLock lockInitMutex(m_initMutex);
+	m_exit = true;
 }
 
 //-----------------------------------------------------------------------------
@@ -500,11 +496,10 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 //-----------------------------------------------------------------------------
 bool Driver::Init(uint32 _attempts)
 {
-	m_initMutex->Lock();
+	AutoLock lockInitMutex(m_initMutex);
 
 	if (m_exit)
 	{
-		m_initMutex->Unlock();
 		return false;
 	}
 
@@ -517,7 +512,6 @@ bool Driver::Init(uint32 _attempts)
 	if (!m_controller->Open(m_controllerPath))
 	{
 		Log::Write(LogLevel_Warning, "WARNING: Failed to init the controller (attempt %d)", _attempts);
-		m_initMutex->Unlock();
 		return false;
 	}
 
@@ -540,8 +534,6 @@ bool Driver::Init(uint32 _attempts)
 	//Msg* msg = new Msg( "FUNC_ID_ZW_SET_PROMISCUOUS_MODE", 0xff, REQUEST, FUNC_ID_ZW_SET_PROMISCUOUS_MODE, false, false );
 	//msg->Append( 0xff );
 	//SendMsg( msg );
-
-	m_initMutex->Unlock();
 
 	// Init successful
 	return true;
@@ -906,11 +898,10 @@ void Driver::SendQueryStageComplete(uint8 const _nodeId, Node::QueryStage const 
 
 		// Non-sleeping node
 		Log::Write(LogLevel_Detail, node->GetNodeId(), "Queuing (%s) Query Stage Complete (%s)", c_sendQueueNames[MsgQueue_Query], node->GetQueryStageName(_stage).c_str());
-		m_sendMutex->Lock();
+		
+		AutoLock lockSendMutex(m_sendMutex);
 		m_msgQueue[MsgQueue_Query].push_back(item);
 		m_queueEvent[MsgQueue_Query]->Set();
-		m_sendMutex->Unlock();
-
 	}
 }
 
@@ -920,12 +911,11 @@ void Driver::SendQueryStageComplete(uint8 const _nodeId, Node::QueryStage const 
 //-----------------------------------------------------------------------------
 void Driver::RetryQueryStageComplete(uint8 const _nodeId, Node::QueryStage const _stage)
 {
+	AutoLock lockSendMutex(m_sendMutex);
 	MsgQueueItem item;
 	item.m_command = MsgQueueCmd_QueryStageComplete;
 	item.m_nodeId = _nodeId;
 	item.m_queryStage = _stage;
-
-	m_sendMutex->Lock();
 
 	for (list<MsgQueueItem>::iterator it = m_msgQueue[MsgQueue_Query].begin(); it != m_msgQueue[MsgQueue_Query].end(); ++it)
 	{
@@ -935,7 +925,6 @@ void Driver::RetryQueryStageComplete(uint8 const _nodeId, Node::QueryStage const
 			break;
 		}
 	}
-	m_sendMutex->Unlock();
 }
 
 //-----------------------------------------------------------------------------
@@ -996,10 +985,10 @@ void Driver::SendMsg(Internal::Msg* _msg, MsgQueue const _queue)
 		}
 	}
 	Log::Write(LogLevel_Detail, GetNodeNumber(_msg), "Queuing (%s) %s", c_sendQueueNames[_queue], _msg->GetAsString().c_str());
-	m_sendMutex->Lock();
+	
+	AutoLock lockSendMutex(m_sendMutex);
 	m_msgQueue[_queue].push_back(item);
 	m_queueEvent[_queue]->Set();
-	m_sendMutex->Unlock();
 }
 
 //-----------------------------------------------------------------------------
@@ -4175,7 +4164,7 @@ bool Driver::isPolled(ValueID const &_valueId)
 	bool bPolled;
 
 	// make sure the polling thread doesn't lock the node while we're in this function
-	m_pollMutex->Lock();
+	AutoLock lockPollMutex(m_pollMutex);
 
 	Internal::VC::Value* value = GetValue(_valueId);
 	if (value && value->GetPollIntensity() != 0)
@@ -4210,7 +4199,6 @@ bool Driver::isPolled(ValueID const &_valueId)
 				// Found it
 				if (bPolled)
 				{
-					m_pollMutex->Unlock();
 					return true;
 				}
 				else
@@ -4224,7 +4212,6 @@ bool Driver::isPolled(ValueID const &_valueId)
 
 		if (!bPolled)
 		{
-			m_pollMutex->Unlock();
 			return false;
 		}
 		else
@@ -4232,9 +4219,6 @@ bool Driver::isPolled(ValueID const &_valueId)
 			Log::Write(LogLevel_Error, nodeId, "IsPolled setting for valueId 0x%016x is not consistent with the poll list", _valueId.GetId());
 		}
 	}
-
-	// allow the poll thread to continue
-	m_pollMutex->Unlock();
 
 	Log::Write(LogLevel_Info, "isPolled failed - node %d not found (the value reported that it is%s polled)", nodeId, bPolled ? "" : " not");
 	return false;
@@ -4247,15 +4231,16 @@ bool Driver::isPolled(ValueID const &_valueId)
 void Driver::SetPollIntensity(ValueID const &_valueId, uint8 const _intensity)
 {
 	// make sure the polling thread doesn't lock the value while we're in this function
-	m_pollMutex->Lock();
+	AutoLock lockPollMutex(m_pollMutex);
 
 	Internal::VC::Value* value = GetValue(_valueId);
 	if (!value)
 		return;
+
 	value->SetPollIntensity(_intensity);
 
 	value->Release();
-	m_pollMutex->Unlock();
+	
 	WriteCache();
 }
 

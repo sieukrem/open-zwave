@@ -1014,7 +1014,7 @@ namespace OpenZWave
 			bool downloadMFSRevision();
 		private:
 			Internal::ManufacturerSpecificDB *m_mfs;
-
+			void SignalExit();
 	};
 
 } // namespace OpenZWave
