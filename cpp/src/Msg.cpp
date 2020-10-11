@@ -60,8 +60,8 @@ namespace OpenZWave
 				m_expectedReply = _expectedReply ? _expectedReply : _function;
 			}
 
-			memset(m_buffer, 0x00, 256);
-			memset(e_buffer, 0x00, 256);
+			memset(m_buffer, 0x00, sizeof(m_buffer));
+			memset(e_buffer, 0x00, sizeof(e_buffer));
 
 			m_buffer[0] = SOF;
 			m_buffer[1] = 0;					// Length of the following data, filled in during Finalize.
@@ -152,8 +152,8 @@ namespace OpenZWave
 					s_nextCallbackId = 10;
 				}
 
-				m_buffer[m_length++] = s_nextCallbackId;
 				m_callbackId = s_nextCallbackId++;
+				m_buffer[m_length++] = m_callbackId;
 			}
 			else
 			{

@@ -81,6 +81,7 @@
 #include <iomanip>
 
 using namespace OpenZWave;
+using namespace OpenZWave::Internal;
 
 // Version numbering for saved configurations. Any change that will invalidate
 // previously saved configurations must be accompanied by an increment to the
@@ -325,132 +326,14 @@ void Driver::DriverThreadEntryPoint(Internal::Platform::Event* _exitEvent, void*
 	}
 }
 
-//-----------------------------------------------------------------------------
-// <Driver::DriverThreadProc>
-// Create and manage the worker threads
-//-----------------------------------------------------------------------------
-void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
-{
-#define WAITOBJECTCOUNT 11
+bool Driver::InitLoop(Internal::Platform::Event* _exitEvent){
 
 	uint32 attempts = 0;
-	bool mfsisReady = false;
 	while (true)
 	{
 		if (Init(attempts))
 		{
-			// Driver has been initialised
-			Internal::Platform::Wait* waitObjects[WAITOBJECTCOUNT];
-			waitObjects[0] = _exitEvent;						// Thread must exit.
-			waitObjects[1] = m_notificationsEvent;				// Notifications waiting to be sent.
-			waitObjects[2] = m_queueMsgEvent;
-			;					// a DNS and HTTP Event
-			waitObjects[3] = m_controller;					    // Controller has received data.
-			waitObjects[4] = m_queueEvent[MsgQueue_Command];	// A controller command is in progress.
-			waitObjects[5] = m_queueEvent[MsgQueue_NoOp];		// Send device probes and diagnostics messages
-			waitObjects[6] = m_queueEvent[MsgQueue_Controller];	// A multi-part controller command is in progress
-			waitObjects[7] = m_queueEvent[MsgQueue_WakeUp];		// A node has woken. Pending messages should be sent.
-			waitObjects[8] = m_queueEvent[MsgQueue_Send];		// Ordinary requests to be sent.
-			waitObjects[9] = m_queueEvent[MsgQueue_Query];		// Node queries are pending.
-			waitObjects[10] = m_queueEvent[MsgQueue_Poll];		// Poll request is waiting.
-
-			Internal::Platform::TimeStamp retryTimeStamp;
-			int retryTimeout = RETRY_TIMEOUT;
-			Options::Get()->GetOptionAsInt("RetryTimeout", &retryTimeout);
-			//retryTimeout = RETRY_TIMEOUT * 10;
-			while (true)
-			{
-				Log::Write(LogLevel_StreamDetail, "      Top of DriverThreadProc loop.");
-				uint32 count = WAITOBJECTCOUNT;
-				int32 timeout = Internal::Platform::Wait::Timeout_Infinite;
-
-				// if the ManufacturerDB class is setting up, we can't do anything yet
-				if (mfsisReady == false)
-				{
-					count = 3;
-
-					// If we're waiting for a message to complete, we can only
-					// handle incoming data, notifications, DNS/HTTP  and exit events.
-				}
-				else if (m_waitingForAck || m_expectedCallbackId || m_expectedReply)
-				{
-					count = 4;
-					timeout = m_waitingForAck ? ACK_TIMEOUT : retryTimeStamp.TimeRemaining();
-					if (timeout < 0)
-					{
-						timeout = 0;
-					}
-				}
-				else if (m_currentControllerCommand != NULL)
-				{
-					count = 7;
-				}
-				else
-				{
-					Log::QueueClear();							// clear the log queue when starting a new message
-				}
-
-				// Wait for something to do
-				int32 res = Internal::Platform::Wait::Multiple(waitObjects, count, timeout);
-
-				switch (res)
-				{
-					case -1:
-					{
-						// Wait has timed out - time to resend
-						if (m_currentMsg != NULL && !m_currentMsg->isResendDuetoCANorNAK())
-						{
-							Notification* notification = new Notification(Notification::Type_Notification);
-							notification->SetHomeAndNodeIds(m_homeId, m_currentMsg->GetTargetNodeId());
-							notification->SetNotification(Notification::Code_Timeout);
-							QueueNotification(notification);
-						}
-						if (WriteMsg("Wait Timeout"))
-						{
-							retryTimeStamp.SetTime(retryTimeout);
-						}
-						break;
-					}
-					case 0:
-					{
-						SignalExit();	
-						return;
-					}
-					case 1:
-					{
-						// Notifications are waiting to be sent
-						NotifyWatchers();
-						break;
-					}
-					case 2:
-					{
-						// a DNS or HTTP Event has occurred
-						ProcessEventMsg();
-						if (mfsisReady == false && m_mfs->isReady())
-						{
-							Notification* notification = new Notification(Notification::Type_ManufacturerSpecificDBReady);
-							QueueNotification(notification);
-							mfsisReady = true;
-						}
-						break;
-					}
-					case 3:
-					{
-						// Data has been received
-						ReadMsg();
-						break;
-					}
-					default:
-					{
-						// All the other events are sending message queue items
-						if (WriteNextMsg((MsgQueue) (res - 4)))
-						{
-							retryTimeStamp.SetTime(retryTimeout);
-						}
-						break;
-					}
-				}
-			}
+			return true;
 		}
 
 		++attempts;
@@ -461,7 +344,7 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 		{
 			Manager::Get()->Manager::SetDriverReady(this, false);
 			NotifyWatchers();
-			break;
+			return false;
 		}
 
 		if (attempts < 25)
@@ -470,7 +353,7 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 			if (Internal::Platform::Wait::Single(_exitEvent, 5000) == 0)
 			{	
 				SignalExit();
-				return;
+				return false;
 			}
 		}
 		else
@@ -479,7 +362,137 @@ void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
 			if (Internal::Platform::Wait::Single(_exitEvent, 30000) == 0)
 			{
 				SignalExit();
+				return false;
+			}
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+// <Driver::DriverThreadProc>
+// Create and manage the worker threads
+//-----------------------------------------------------------------------------
+void Driver::DriverThreadProc(Internal::Platform::Event* _exitEvent)
+{
+#define WAITOBJECTCOUNT 11
+
+	if (!InitLoop(_exitEvent))
+	{
+		return;
+	}
+
+
+	// Driver has been initialised
+	Internal::Platform::Wait* waitObjects[WAITOBJECTCOUNT];
+	waitObjects[0] = _exitEvent;						// Thread must exit.
+	waitObjects[1] = m_notificationsEvent;				// Notifications waiting to be sent.
+	waitObjects[2] = m_queueMsgEvent;
+	;					// a DNS and HTTP Event
+	waitObjects[3] = m_controller;					    // Controller has received data.
+	waitObjects[4] = m_queueEvent[MsgQueue_Command];	// A controller command is in progress.
+	waitObjects[5] = m_queueEvent[MsgQueue_NoOp];		// Send device probes and diagnostics messages
+	waitObjects[6] = m_queueEvent[MsgQueue_Controller];	// A multi-part controller command is in progress
+	waitObjects[7] = m_queueEvent[MsgQueue_WakeUp];		// A node has woken. Pending messages should be sent.
+	waitObjects[8] = m_queueEvent[MsgQueue_Send];		// Ordinary requests to be sent.
+	waitObjects[9] = m_queueEvent[MsgQueue_Query];		// Node queries are pending.
+	waitObjects[10] = m_queueEvent[MsgQueue_Poll];		// Poll request is waiting.
+
+	Internal::Platform::TimeStamp retryTimeStamp;
+	int retryTimeout = RETRY_TIMEOUT;
+	Options::Get()->GetOptionAsInt("RetryTimeout", &retryTimeout);
+
+	bool mfsisReady = false;
+
+	while (true)
+	{
+		Log::Write(LogLevel_StreamDetail, "      Top of DriverThreadProc loop.");
+		uint32 count = WAITOBJECTCOUNT;
+		int32 timeout = Internal::Platform::Wait::Timeout_Infinite;
+
+		// if the ManufacturerDB class is setting up, we can't do anything yet
+		if (mfsisReady == false)
+		{
+			count = 3;
+
+			// If we're waiting for a message to complete, we can only
+			// handle incoming data, notifications, DNS/HTTP  and exit events.
+		}
+		else if (m_waitingForAck || m_expectedCallbackId || m_expectedReply)
+		{
+			count = 4;
+			timeout = m_waitingForAck ? ACK_TIMEOUT : retryTimeStamp.TimeRemaining();
+			if (timeout < 0)
+			{
+				timeout = 0;
+			}
+		}
+		else if (m_currentControllerCommand != NULL)
+		{
+			count = 7;
+		}
+		else
+		{
+			Log::QueueClear();							// clear the log queue when starting a new message
+		}
+
+		// Wait for something to do
+		int32 res = Internal::Platform::Wait::Multiple(waitObjects, count, timeout);
+
+		switch (res)
+		{
+			case -1:
+			{
+				// Wait has timed out - time to resend
+				if (m_currentMsg != NULL && !m_currentMsg->isResendDuetoCANorNAK())
+				{
+					Notification* notification = new Notification(Notification::Type_Notification);
+					notification->SetHomeAndNodeIds(m_homeId, m_currentMsg->GetTargetNodeId());
+					notification->SetNotification(Notification::Code_Timeout);
+					QueueNotification(notification);
+				}
+				if (WriteMsg("Wait Timeout"))
+				{
+					retryTimeStamp.SetTime(retryTimeout);
+				}
+				break;
+			}
+			case 0:
+			{
+				SignalExit();	
 				return;
+			}
+			case 1:
+			{
+				// Notifications are waiting to be sent
+				NotifyWatchers();
+				break;
+			}
+			case 2:
+			{
+				// a DNS or HTTP Event has occurred
+				ProcessEventMsg();
+				if (mfsisReady == false && m_mfs->isReady())
+				{
+					Notification* notification = new Notification(Notification::Type_ManufacturerSpecificDBReady);
+					QueueNotification(notification);
+					mfsisReady = true;
+				}
+				break;
+			}
+			case 3:
+			{
+				// Data has been received
+				ReadMsg();
+				break;
+			}
+			default:
+			{
+				// All the other events are sending message queue items
+				if (WriteNextMsg((MsgQueue) (res - 4)))
+				{
+					retryTimeStamp.SetTime(retryTimeout);
+				}
+				break;
 			}
 		}
 	}
@@ -899,9 +912,7 @@ void Driver::SendQueryStageComplete(uint8 const _nodeId, Node::QueryStage const 
 		// Non-sleeping node
 		Log::Write(LogLevel_Detail, node->GetNodeId(), "Queuing (%s) Query Stage Complete (%s)", c_sendQueueNames[MsgQueue_Query], node->GetQueryStageName(_stage).c_str());
 		
-		AutoLock lockSendMutex(m_sendMutex);
-		m_msgQueue[MsgQueue_Query].push_back(item);
-		m_queueEvent[MsgQueue_Query]->Set();
+		QueueMsg(MsgQueue_Query, item);
 	}
 }
 
@@ -986,9 +997,7 @@ void Driver::SendMsg(Internal::Msg* _msg, MsgQueue const _queue)
 	}
 	Log::Write(LogLevel_Detail, GetNodeNumber(_msg), "Queuing (%s) %s", c_sendQueueNames[_queue], _msg->GetAsString().c_str());
 	
-	AutoLock lockSendMutex(m_sendMutex);
-	m_msgQueue[_queue].push_back(item);
-	m_queueEvent[_queue]->Set();
+	QueueMsg(_queue, item);
 }
 
 //-----------------------------------------------------------------------------
@@ -1178,27 +1187,25 @@ bool Driver::WriteMsg(string const &msg)
 		m_currentMsg->UpdateCallbackId();
 	}
 
-	/* XXX TODO: Minor Bug - Due to the post increament of the SendAttempts, it means our final NONCE_GET will go though
+	/* XXX TODO: Minor Bug - Due to the post increment of the SendAttempts, it means our final NONCE_GET will go though
 	 * but the subsequent MSG send will fail (as the counter is incremented only upon a successful NONCE_GET, and Not a Send
 	 *
 	 */
 
 	if (m_nonceReportSent == 0)
 	{
-		if (m_currentMsg->isEncrypted() && !m_currentMsg->isNonceRecieved())
+		if (!m_currentMsg->isEncrypted() || !m_currentMsg->isNonceRecieved())
 		{
 			m_currentMsg->SetSendAttempts(++attempts);
 		}
-		else if (!m_currentMsg->isEncrypted())
-		{
-			m_currentMsg->SetSendAttempts(++attempts);
-		}
+
 		m_expectedCallbackId = m_currentMsg->GetCallbackId();
 		m_expectedCommandClassId = m_currentMsg->GetExpectedCommandClassId();
 		m_expectedNodeId = m_currentMsg->GetTargetNodeId();
 		m_expectedReply = m_currentMsg->GetExpectedReply();
 		m_waitingForAck = true;
 	}
+
 	string attemptsstr = "";
 	if (attempts > 1)
 	{
@@ -1620,7 +1627,7 @@ bool Driver::ReadMsg()
 {
 	uint8 buffer[1024];
 
-	memset(buffer, 0, sizeof(uint8) * 1024);
+	memset(buffer, 0, sizeof(buffer));
 
 	if (!m_controller->Read(buffer, 1))
 	{
@@ -1688,11 +1695,7 @@ bool Driver::ReadMsg()
 			Log::Write(LogLevel_Detail, nodeId, "  Received: %s", str.c_str());
 
 			// Verify checksum
-			uint8 checksum = 0xff;
-			for (uint32 i = 1; i < (length - 1); ++i)
-			{
-				checksum ^= buffer[i];
-			}
+			uint8 checksum = CalculateChecksum(buffer, length-1);
 
 			if (buffer[length - 1] == checksum)
 			{
@@ -4240,7 +4243,7 @@ void Driver::SetPollIntensity(ValueID const &_valueId, uint8 const _intensity)
 	value->SetPollIntensity(_intensity);
 
 	value->Release();
-	
+
 	WriteCache();
 }
 
@@ -5093,6 +5096,12 @@ void Driver::RequestNodeNeighbors(uint8 const _nodeId, uint32 const _requestFlag
 	}
 }
 
+void Driver::QueueMsg(MsgQueue msg_queue, MsgQueueItem& msg){
+	AutoLock lockSendMutex(m_sendMutex);
+	m_msgQueue[msg_queue].push_back(msg);
+	m_queueEvent[msg_queue]->Set();
+}
+
 //-----------------------------------------------------------------------------
 // <Driver::BeginControllerCommand>
 // Start the controller performing one of its network management functions
@@ -5123,10 +5132,7 @@ bool Driver::BeginControllerCommand(ControllerCommand _command, pfnControllerCal
 	item.m_command = MsgQueueCmd_Controller;
 	item.m_cci = cci;
 
-	m_sendMutex->Lock();
-	m_msgQueue[MsgQueue_Controller].push_back(item);
-	m_queueEvent[MsgQueue_Controller]->Set();
-	m_sendMutex->Unlock();
+	QueueMsg(MsgQueue_Controller, item);
 
 	return true;
 }
@@ -6649,7 +6655,6 @@ uint8 *Driver::GetNetworkKey()
 //-----------------------------------------------------------------------------
 bool Driver::SendEncryptedMessage()
 {
-
 	uint8 *buffer = m_currentMsg->GetBuffer();
 	uint8 length = m_currentMsg->GetLength();
 	m_expectedCallbackId = m_currentMsg->GetCallbackId();
@@ -6664,31 +6669,27 @@ bool Driver::SendEncryptedMessage()
 bool Driver::SendNonceRequest(string logmsg)
 {
 
-	uint8 m_buffer[11];
+	uint8 buffer[11];
 
 	/* construct a standard NONCE_GET message */
-	m_buffer[0] = SOF;
-	m_buffer[1] = 9;					// Length of the entire message
-	m_buffer[2] = REQUEST;
-	m_buffer[3] = FUNC_ID_ZW_SEND_DATA;
-	m_buffer[4] = m_currentMsg->GetTargetNodeId();
-	m_buffer[5] = 2; 					// Length of the payload
-	m_buffer[6] = Internal::CC::Security::StaticGetCommandClassId();
-	m_buffer[7] = Internal::CC::SecurityCmd_NonceGet;
-	//m_buffer[8] = TRANSMIT_OPTION_ACK | TRANSMIT_OPTION_AUTO_ROUTE;
-	m_buffer[8] = TRANSMIT_OPTION_ACK | TRANSMIT_OPTION_AUTO_ROUTE;
+	buffer[0] = SOF;
+	buffer[1] = 9;					// Length of the entire message
+	buffer[2] = REQUEST;
+	buffer[3] = FUNC_ID_ZW_SEND_DATA;
+	buffer[4] = m_currentMsg->GetTargetNodeId();
+	buffer[5] = 2; 					// Length of the payload
+	buffer[6] = Internal::CC::Security::StaticGetCommandClassId();
+	buffer[7] = Internal::CC::SecurityCmd_NonceGet;
+	buffer[8] = TRANSMIT_OPTION_ACK | TRANSMIT_OPTION_AUTO_ROUTE;
 	/* this is the same as the Actual Message */
 	//m_buffer[9] = m_expectedCallbackId;
-	m_buffer[9] = 2;
-	// Calculate the checksum
-	m_buffer[10] = 0xff;
-	for (uint32 i = 1; i < 10; ++i)
-	{
-		m_buffer[10] ^= m_buffer[i];
-	}
-	Log::Write(LogLevel_Info, m_currentMsg->GetTargetNodeId(), "Sending (%s) message (Callback ID=0x%.2x, Expected Reply=0x%.2x) - Nonce_Get(%s) - %s:", c_sendQueueNames[m_currentMsgQueueSource], 2, m_expectedReply, logmsg.c_str(), Internal::PktToString(m_buffer, 10).c_str());
+	buffer[9] = 2;
 
-	m_controller->Write(m_buffer, 11);
+	buffer[10] = CalculateChecksum(buffer, 10);
+
+	Log::Write(LogLevel_Info, m_currentMsg->GetTargetNodeId(), "Sending (%s) message (Callback ID=0x%.2x, Expected Reply=0x%.2x) - Nonce_Get(%s) - %s:", c_sendQueueNames[m_currentMsgQueueSource], 2, m_expectedReply, logmsg.c_str(), Internal::PktToString(buffer, 10).c_str());
+
+	m_controller->Write(buffer, 11);
 
 	return true;
 }
@@ -6766,36 +6767,41 @@ bool Driver::initNetworkKeys(bool newnode)
 	aes_mode_reset(this->AuthKey);
 	return true;
 }
+uint8 Driver::CalculateChecksum(uint8* buffer, size_t len){
+	uint8 checksum = 0xff;
+	for (uint32 i = 1; i < len; ++i)
+	{
+		checksum ^= buffer[i];
+	}
+	return checksum;
+}
 
 void Driver::SendNonceKey(uint8 nodeId, uint8 *nonce)
 {
 
-	uint8 m_buffer[19];
+	uint8 buffer[19];
 	/* construct a standard NONCE_GET message */
-	m_buffer[0] = SOF;
-	m_buffer[1] = 17;					// Length of the entire message
-	m_buffer[2] = REQUEST;
-	m_buffer[3] = FUNC_ID_ZW_SEND_DATA;
-	m_buffer[4] = nodeId;
-	m_buffer[5] = 10; 					// Length of the payload
-	m_buffer[6] = Internal::CC::Security::StaticGetCommandClassId();
-	m_buffer[7] = Internal::CC::SecurityCmd_NonceReport;
+	buffer[0] = SOF;
+	buffer[1] = 17;					// Length of the entire message
+	buffer[2] = REQUEST;
+	buffer[3] = FUNC_ID_ZW_SEND_DATA;
+	buffer[4] = nodeId;
+	buffer[5] = 10; 					// Length of the payload
+	buffer[6] = Internal::CC::Security::StaticGetCommandClassId();
+	buffer[7] = Internal::CC::SecurityCmd_NonceReport;
 	for (int i = 0; i < 8; ++i)
 	{
-		m_buffer[8 + i] = nonce[i];
+		buffer[8 + i] = nonce[i];
 	}
-	m_buffer[16] = TRANSMIT_OPTION_ACK | TRANSMIT_OPTION_AUTO_ROUTE;
+	buffer[16] = TRANSMIT_OPTION_ACK | TRANSMIT_OPTION_AUTO_ROUTE;
 	/* this is the same as the Actual Message */
-	m_buffer[17] = 1;
-	// Calculate the checksum
-	m_buffer[18] = 0xff;
-	for (uint32 i = 1; i < 18; ++i)
-	{
-		m_buffer[18] ^= m_buffer[i];
-	}
-	Log::Write(LogLevel_Info, nodeId, "Sending (%s) message (Callback ID=0x%.2x, Expected Reply=0x%.2x) - Nonce_Report - %s:", c_sendQueueNames[m_currentMsgQueueSource], m_buffer[17], m_expectedReply, Internal::PktToString(m_buffer, 19).c_str());
+	buffer[17] = 1;
+	
+	buffer[18] = CalculateChecksum(buffer, 18);
 
-	m_controller->Write(m_buffer, 19);
+	Log::Write(LogLevel_Info, nodeId, "Sending (%s) message (Callback ID=0x%.2x, Expected Reply=0x%.2x) - Nonce_Report - %s:", c_sendQueueNames[m_currentMsgQueueSource], buffer[17], m_expectedReply, Internal::PktToString(buffer, 19).c_str());
+
+	m_controller->Write(buffer, 19);
 
 	m_nonceReportSent = nodeId;
 }

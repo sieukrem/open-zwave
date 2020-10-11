@@ -1015,6 +1015,9 @@ namespace OpenZWave
 		private:
 			Internal::ManufacturerSpecificDB *m_mfs;
 			void SignalExit();
+			bool InitLoop(Internal::Platform::Event* _exitEvent);
+			uint8 CalculateChecksum(uint8* buffer, size_t len);
+			void QueueMsg(MsgQueue msg_queue, MsgQueueItem& msg);
 	};
 
 } // namespace OpenZWave
